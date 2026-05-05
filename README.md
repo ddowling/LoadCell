@@ -8,6 +8,8 @@ A standalone digital scale built on a Raspberry Pi Pico running MicroPython. Rea
 - Adaptive lowpass filter — snappy response to load changes, stable at rest
 - **Short press** tare button: tare and zero the scale
 - **Long press** tare button (≥1s): cycle through units
+- **Peak hold mode** — captures the stable peak weight, ignoring loading impulses
+- **Item count mode** — for coin and pill counting; shows count on line 1, weight on line 2
 - Calibration and tare saved to flash (`cal.json`) — survives power cycles
 - Timer-driven measurement loop — REPL remains available while the scale runs
 
@@ -72,6 +74,38 @@ set_unit('oz')   # g, kg, oz, lbs
 ```
 
 Or hold the tare button for ≥1 second to cycle through units on the device.
+
+## Peak Hold
+
+Captures the stable peak weight — loading impulses are ignored. The peak updates only once the reading has been steady for ~500ms.
+
+```python
+peak_hold()       # enable
+peak_hold(False)  # disable
+peak_reset()      # clear stored peak without disabling
+```
+
+Line 1 shows live weight; line 2 shows `PK: 1234.5 g` when active.
+
+## Item Count Mode
+
+Useful for counting coins, pills, or other uniform items.
+
+```python
+tare()        # empty platform
+peak_hold()   # enable peak hold
+# place one item on the platform and wait ~1s for a stable reading
+count_mode()  # switch to count mode using the captured unit weight
+```
+
+Or with a known unit weight:
+
+```python
+count_mode(5.23)   # 5.23g per item — skips the peak hold step
+count_mode(False)  # return to normal mode
+```
+
+Line 1 shows the item count; line 2 shows the total weight.
 
 ## LCD I2C Address
 
