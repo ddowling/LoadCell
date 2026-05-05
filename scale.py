@@ -1,5 +1,6 @@
 import json
-from machine import Pin, I2C, Timer, ADC
+import _thread
+from machine import Pin, I2C, ADC
 from utime import ticks_ms, ticks_diff, sleep_ms
 from hx711_gpio import HX711
 from lcd_i2c import LCD
@@ -8,12 +9,13 @@ from lcd_i2c import LCD
 _SCK      = Pin(6, Pin.OUT)
 _DATA     = Pin(7, Pin.IN, Pin.PULL_DOWN)
 _TARE_BTN = Pin(2, Pin.IN, Pin.PULL_UP)   # active-low, internal pull-up
-_I2C_SDA  = Pin(4)
-_I2C_SCL  = Pin(5)
+_I2C_SDA  = Pin(4, pull=Pin.PULL_UP)
+_I2C_SCL  = Pin(5, pull=Pin.PULL_UP)
 
 # --- Hardware init ---
 _i2c = I2C(0, sda=_I2C_SDA, scl=_I2C_SCL, freq=400_000)
-lcd  = LCD(_i2c, address=0x27)             # change to 0x3F if needed
+lcd  = LCD(_i2c, address=0x3F)             # change to 0x27 if needed
+
 hx   = HX711(_SCK, _DATA)
 Pin(23, Pin.OUT).value(1)                  # SMPS power-save mode for better battery efficiency
 
@@ -61,7 +63,7 @@ def _fmt_battery():
         s += "  CRIT!"
     elif _bat_v < _BAT_LOW_V:
         s += "  Low"
-    return s.ljust(16)[:16]
+    return f"{s:<16}"[:16]
 
 # --- Calibration ---
 _CAL_FILE    = "cal.json"
@@ -95,10 +97,14 @@ def save_cal():
 def tare():
     """Tare with empty platform and save offset to cal.json.
     Can be called from REPL or triggered by the tare button."""
+    global _paused
+    _paused = True
+    sleep_ms(200)    # wait for thread to finish current HX711 read
     _status("Taring...")
     hx.tare(15)
     save_cal()
     _status("Tared OK", 2000)
+    _paused = False
     print(f"Tared. Offset={hx.OFFSET:.1f}")
 
 
@@ -109,12 +115,15 @@ def calibrate(known_g, date):
         1. Empty platform  →  tare()
         2. Place known weight  →  calibrate(500, "2025-05-05")
     """
-    global _cal_date
+    global _cal_date, _paused
+    _paused = True
+    sleep_ms(200)
     raw = hx.read_average(15)
     hx.set_scale((raw - hx.OFFSET) / known_g)
     _cal_date = date
     save_cal()
     _status("Cal saved", 2000)
+    _paused = False
     print(f"Calibrated  date={_cal_date}  for {known_g}g  raw={raw:.0f}")
 
 
@@ -216,7 +225,7 @@ _status_clear_at = 0
 def _status(msg, hold_ms=0):
     global _status_clear_at
     lcd.move_to(0, 1)
-    lcd.putstr(msg.ljust(16)[:16])
+    lcd.putstr(f"{msg:<16}"[:16])
     _status_clear_at = (ticks_ms() + hold_ms) if hold_ms else 0
 
 
@@ -224,13 +233,14 @@ def _fmt_weight(grams):
     val = grams * _SCALES[_unit_idx]
     dec = _DECIMALS[_unit_idx]
     s = f"{val:.{dec}f} {_UNITS[_unit_idx]}"
-    return s.rjust(16)
+    return f"{s:>16}"
 
 
 def _fmt_peak(grams):
     val = grams * _SCALES[_unit_idx]
     dec = _DECIMALS[_unit_idx]
-    return f"PK:{val:.{dec}f} {_UNITS[_unit_idx]}".ljust(16)[:16]
+    s = f"PK:{val:.{dec}f} {_UNITS[_unit_idx]}"
+    return f"{s:<16}"[:16]
 
 
 def _fmt_count(grams):
@@ -238,80 +248,92 @@ def _fmt_count(grams):
     return f"Count:{count:>10}"
 
 
-# --- Poll timer ---
+# --- Measure thread (core 1) ---
 
-poll_timer = Timer()
+_thread_running = False
+_paused         = False
 _btn_last       = 1
 _btn_pressed_at = 0
 
 
-def _poll(t):
+def _measure_loop():
     global _btn_last, _btn_pressed_at
     global _prev_weight, _stable_count, _peak_value
     global _bat_v, _bat_poll_count
-    now = ticks_ms()
 
-    w = hx.get_units()
+    while _thread_running:
+        if _paused:
+            sleep_ms(10)
+            continue
 
-    # Line 1: count (count mode) or live weight (all other modes)
-    lcd.move_to(0, 0)
-    lcd.putstr(_fmt_count(w) if _count_mode else _fmt_weight(w))
+        now = ticks_ms()
+        w = hx.get_units()          # blocks ~100ms for HX711 conversion
 
-    # Peak hold: update peak only when reading has been stable for _STABLE_NEEDED samples
-    if _peak_hold:
-        if abs(w - _prev_weight) < _STABLE_THRESHOLD:
-            _stable_count += 1
-            if _stable_count >= _STABLE_NEEDED and w > _peak_value:
-                _peak_value = w
-        else:
-            _stable_count = 0
-        _prev_weight = w
+        if _paused:                  # re-check after the long read
+            continue
 
-    # Battery check every 5s — update cached voltage and CGRAM icon
-    _bat_poll_count += 1
-    if _bat_poll_count >= _BAT_POLL_EVERY:
-        _bat_poll_count = 0
-        _bat_v = get_battery_v()
-        _update_bat_char()
+        # Line 1: count (count mode) or live weight (all other modes)
+        lcd.move_to(0, 0)
+        lcd.putstr(_fmt_count(w) if _count_mode else _fmt_weight(w))
 
-    # Line 2 priority: critical battery > status > mode content > battery indicator
-    if _status_clear_at and ticks_diff(now, _status_clear_at) >= 0:
-        _status("")
-    if _bat_v < _BAT_CRIT_V:
-        lcd.move_to(0, 1)
-        lcd.putstr(_fmt_battery())
-    elif not _status_clear_at:
-        if _count_mode:
-            lcd.move_to(0, 1)
-            lcd.putstr(_fmt_weight(w))
-        elif _peak_hold:
-            lcd.move_to(0, 1)
-            lcd.putstr(_fmt_peak(_peak_value))
-        else:
+        # Peak hold: update peak only when stable for _STABLE_NEEDED samples
+        if _peak_hold:
+            if abs(w - _prev_weight) < _STABLE_THRESHOLD:
+                _stable_count += 1
+                if _stable_count >= _STABLE_NEEDED and w > _peak_value:
+                    _peak_value = w
+            else:
+                _stable_count = 0
+            _prev_weight = w
+
+        # Battery check every 5s — update cached voltage and CGRAM icon
+        _bat_poll_count += 1
+        if _bat_poll_count >= _BAT_POLL_EVERY:
+            _bat_poll_count = 0
+            _bat_v = get_battery_v()
+            _update_bat_char()
+
+        # Line 2 priority: critical battery > status > mode content > battery indicator
+        if _status_clear_at and ticks_diff(now, _status_clear_at) >= 0:
+            _status("")
+        if _bat_v < _BAT_CRIT_V:
             lcd.move_to(0, 1)
             lcd.putstr(_fmt_battery())
+        elif not _status_clear_at:
+            if _count_mode:
+                lcd.move_to(0, 1)
+                lcd.putstr(_fmt_weight(w))
+            elif _peak_hold:
+                lcd.move_to(0, 1)
+                lcd.putstr(_fmt_peak(_peak_value))
+            else:
+                lcd.move_to(0, 1)
+                lcd.putstr(_fmt_battery())
 
-    # Tare button: active-low, short press (>=50ms) = tare, long press (>=1s) = cycle unit
-    btn = _TARE_BTN.value()
-    if btn == 0 and _btn_last == 1:
-        _btn_pressed_at = now
-    elif btn == 1 and _btn_last == 0:
-        held = ticks_diff(now, _btn_pressed_at)
-        if held >= 1000:
-            _cycle_unit()
-        elif held >= 50:
-            tare()
-    _btn_last = btn
+        # Tare button: active-low, short press (>=50ms) = tare, long press (>=1s) = cycle unit
+        btn = _TARE_BTN.value()
+        if btn == 0 and _btn_last == 1:
+            _btn_pressed_at = now
+        elif btn == 1 and _btn_last == 0:
+            held = ticks_diff(now, _btn_pressed_at)
+            if held >= 1000:
+                _cycle_unit()
+            elif held >= 50:
+                tare()
+        _btn_last = btn
 
 
 def monitor(active=True):
+    global _thread_running
     if active:
-        poll_timer.init(mode=Timer.PERIODIC, period=100, callback=_poll)
+        _thread_running = True
+        _thread.start_new_thread(_measure_loop, ())
     else:
-        poll_timer.deinit()
+        _thread_running = False
 
 
 def run():
+    global _bat_v
     load_cal()
     hx.set_adaptive_threshold(int(50 * hx.SCALE))
     hx.set_time_constant(0.1)

@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from machine import enable_irq, disable_irq, idle, Pin
+from machine import enable_irq, disable_irq, Pin
 import time
 
 class HX711:
@@ -60,35 +60,19 @@ class HX711:
         self.read()
         self.filtered = self.read()
 
-    def conversion_done_cb(self, data):
-        self.conversion_done = True
-        data.irq(handler=None)
-
     def read(self):
-        if hasattr(self.data, "irq"):
-            self.conversion_done = False
-            self.data.irq(trigger=Pin.IRQ_FALLING, handler=self.conversion_done_cb)
-            # wait for the device being ready
-            for _ in range(500):
-                if self.conversion_done == True:
-                    break
-                time.sleep_ms(1)
-            else:
-                self.data.irq(handler=None)
-                raise OSError("Sensor does not respond")
+        # Polling only — IRQ callbacks run on core 0 and are not visible from core 1 (_thread)
+        for _ in range(self.__wait_loop):
+            if self.data():
+                break
         else:
-            # wait polling for the trigger pulse
-            for _ in range(self.__wait_loop):
-                if self.data():
-                    break
-            else:
-                raise OSError("No trigger pulse found")
-            for _ in range(5000):
-                if not self.data():
-                    break
-                time.sleep_us(100)
-            else:
-                raise OSError("Sensor does not respond")
+            raise OSError("No trigger pulse found")
+        for _ in range(5000):
+            if not self.data():
+                break
+            time.sleep_us(100)
+        else:
+            raise OSError("Sensor does not respond")
 
         # shift in data, and gain & channel info
         result = 0
