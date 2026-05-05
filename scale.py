@@ -96,6 +96,35 @@ def _cycle_unit():
     _status(_UNITS[_unit_idx], 1000)
 
 
+# --- Peak hold ---
+
+_peak_hold    = False
+_peak_value   = 0.0
+_prev_weight  = 0.0
+_stable_count = 0
+
+_STABLE_THRESHOLD = 2.0   # grams change per sample to be considered stable
+_STABLE_NEEDED    = 5     # consecutive stable samples required before updating peak
+
+
+def peak_hold(active=True):
+    """Enable or disable peak hold mode. peak_hold(False) to turn off."""
+    global _peak_hold, _peak_value, _stable_count
+    _peak_hold    = active
+    _peak_value   = 0.0
+    _stable_count = 0
+    if not active:
+        _status("")
+    print(f"Peak hold {'on' if active else 'off'}")
+
+
+def peak_reset():
+    """Clear the stored peak value."""
+    global _peak_value, _stable_count
+    _peak_value   = 0.0
+    _stable_count = 0
+
+
 # --- Display helpers ---
 
 _status_clear_at = 0
@@ -115,6 +144,12 @@ def _fmt_weight(grams):
     return s.rjust(16)
 
 
+def _fmt_peak(grams):
+    val = grams * _SCALES[_unit_idx]
+    dec = _DECIMALS[_unit_idx]
+    return f"PK:{val:.{dec}f} {_UNITS[_unit_idx]}".ljust(16)[:16]
+
+
 # --- Poll timer ---
 
 poll_timer = Timer()
@@ -124,14 +159,29 @@ _btn_pressed_at = 0
 
 def _poll(t):
     global _btn_last, _btn_pressed_at
+    global _prev_weight, _stable_count, _peak_value
     now = ticks_ms()
 
     w = hx.get_units()
     lcd.move_to(0, 0)
     lcd.putstr(_fmt_weight(w))
 
+    # Peak hold: update peak only when reading has been stable for _STABLE_NEEDED samples
+    if _peak_hold:
+        if abs(w - _prev_weight) < _STABLE_THRESHOLD:
+            _stable_count += 1
+            if _stable_count >= _STABLE_NEEDED and w > _peak_value:
+                _peak_value = w
+        else:
+            _stable_count = 0
+        _prev_weight = w
+
+    # Line 2: status messages take priority; show peak when no status is active
     if _status_clear_at and ticks_diff(now, _status_clear_at) >= 0:
         _status("")
+    if _peak_hold and not _status_clear_at:
+        lcd.move_to(0, 1)
+        lcd.putstr(_fmt_peak(_peak_value))
 
     # Tare button: active-low, short press (>=50ms) = tare, long press (>=1s) = cycle unit
     btn = _TARE_BTN.value()
