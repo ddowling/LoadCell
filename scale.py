@@ -125,6 +125,42 @@ def peak_reset():
     _stable_count = 0
 
 
+# --- Count mode ---
+
+_count_mode  = False
+_unit_weight = 0.0
+
+
+def count_mode(unit_g=None):
+    """Enter item count mode for coin/pill counting.
+
+    Workflow:
+        1. tare()                  — empty platform
+        2. Place one item, wait for peak hold to capture it
+        3. count_mode()            — uses peak value as unit weight
+           count_mode(False)       — exit count mode
+           count_mode(5.23)        — explicit unit weight in grams
+
+    Display: line 1 = count, line 2 = live weight.
+    """
+    global _count_mode, _unit_weight, _peak_hold
+    if unit_g is False:
+        _count_mode = False
+        _status("")
+        print("Count mode off")
+        return
+    if unit_g is None:
+        if _peak_value <= 0:
+            print("No peak value — enable peak_hold(), weigh one item, then call count_mode()")
+            return
+        unit_g = _peak_value
+    _unit_weight = float(unit_g)
+    _count_mode  = True
+    _peak_hold   = False
+    _status("")
+    print(f"Count mode on  unit={_unit_weight:.3f}g")
+
+
 # --- Display helpers ---
 
 _status_clear_at = 0
@@ -150,6 +186,11 @@ def _fmt_peak(grams):
     return f"PK:{val:.{dec}f} {_UNITS[_unit_idx]}".ljust(16)[:16]
 
 
+def _fmt_count(grams):
+    count = max(0, int(grams / _unit_weight + 0.5)) if _unit_weight > 0 else 0
+    return f"Count:{count:>10}"
+
+
 # --- Poll timer ---
 
 poll_timer = Timer()
@@ -163,8 +204,10 @@ def _poll(t):
     now = ticks_ms()
 
     w = hx.get_units()
+
+    # Line 1: count (count mode) or live weight (all other modes)
     lcd.move_to(0, 0)
-    lcd.putstr(_fmt_weight(w))
+    lcd.putstr(_fmt_count(w) if _count_mode else _fmt_weight(w))
 
     # Peak hold: update peak only when reading has been stable for _STABLE_NEEDED samples
     if _peak_hold:
@@ -176,12 +219,16 @@ def _poll(t):
             _stable_count = 0
         _prev_weight = w
 
-    # Line 2: status messages take priority; show peak when no status is active
+    # Line 2: status messages take priority, then mode-specific content
     if _status_clear_at and ticks_diff(now, _status_clear_at) >= 0:
         _status("")
-    if _peak_hold and not _status_clear_at:
-        lcd.move_to(0, 1)
-        lcd.putstr(_fmt_peak(_peak_value))
+    if not _status_clear_at:
+        if _count_mode:
+            lcd.move_to(0, 1)
+            lcd.putstr(_fmt_weight(w))
+        elif _peak_hold:
+            lcd.move_to(0, 1)
+            lcd.putstr(_fmt_peak(_peak_value))
 
     # Tare button: active-low, short press (>=50ms) = tare, long press (>=1s) = cycle unit
     btn = _TARE_BTN.value()
