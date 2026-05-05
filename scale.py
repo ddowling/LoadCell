@@ -1,5 +1,5 @@
 import json
-from machine import Pin, I2C, Timer
+from machine import Pin, I2C, Timer, ADC
 from utime import ticks_ms, ticks_diff, sleep_ms
 from hx711_gpio import HX711
 from lcd_i2c import LCD
@@ -15,6 +15,53 @@ _I2C_SCL  = Pin(5)
 _i2c = I2C(0, sda=_I2C_SDA, scl=_I2C_SCL, freq=400_000)
 lcd  = LCD(_i2c, address=0x27)             # change to 0x3F if needed
 hx   = HX711(_SCK, _DATA)
+Pin(23, Pin.OUT).value(1)                  # SMPS power-save mode for better battery efficiency
+
+# --- Battery monitor (GP26, 100k/100k divider) ---
+_bat_adc        = ADC(Pin(26))
+_BAT_SCALE      = 2 * 3.3 / 65535         # adjust numerator if using different divider ratio
+_BAT_LOW_V      = 3.5                      # show warning below this voltage
+_BAT_CRIT_V     = 3.2                      # always-on warning below this voltage
+_bat_v          = 4.2                      # cached reading, updated every 5s
+_bat_poll_count = 0
+_BAT_POLL_EVERY = 50                       # 50 × 100ms = every 5s
+
+
+def get_battery_v():
+    """Return current battery voltage (GP26, 100k/100k divider)."""
+    return _bat_adc.read_u16() * _BAT_SCALE
+
+
+# 5×8 battery icons, fill rises from bottom. CGRAM slot 0.
+# Each row is 5 bits: 0x1F=full, 0x11=side walls only, 0x0E=nub (centre 3).
+_BAT_CHARS = [
+    [0x0E, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00],  # empty
+    [0x0E, 0x1F, 0x11, 0x11, 0x11, 0x1F, 0x1F, 0x00],  # 1/4
+    [0x0E, 0x1F, 0x11, 0x11, 0x1F, 0x1F, 0x1F, 0x00],  # 1/2
+    [0x0E, 0x1F, 0x11, 0x1F, 0x1F, 0x1F, 0x1F, 0x00],  # 3/4
+    [0x0E, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x00],  # full
+]
+
+
+def _bat_level():
+    if _bat_v >= 4.0: return 4
+    if _bat_v >= 3.8: return 3
+    if _bat_v >= 3.6: return 2
+    if _bat_v >= 3.5: return 1
+    return 0
+
+
+def _update_bat_char():
+    lcd.define_char(0, _BAT_CHARS[_bat_level()])
+
+
+def _fmt_battery():
+    s = f"\x00 {_bat_v:.2f}V"
+    if _bat_v < _BAT_CRIT_V:
+        s += "  CRIT!"
+    elif _bat_v < _BAT_LOW_V:
+        s += "  Low"
+    return s.ljust(16)[:16]
 
 # --- Calibration ---
 _CAL_FILE    = "cal.json"
@@ -201,6 +248,7 @@ _btn_pressed_at = 0
 def _poll(t):
     global _btn_last, _btn_pressed_at
     global _prev_weight, _stable_count, _peak_value
+    global _bat_v, _bat_poll_count
     now = ticks_ms()
 
     w = hx.get_units()
@@ -219,16 +267,29 @@ def _poll(t):
             _stable_count = 0
         _prev_weight = w
 
-    # Line 2: status messages take priority, then mode-specific content
+    # Battery check every 5s — update cached voltage and CGRAM icon
+    _bat_poll_count += 1
+    if _bat_poll_count >= _BAT_POLL_EVERY:
+        _bat_poll_count = 0
+        _bat_v = get_battery_v()
+        _update_bat_char()
+
+    # Line 2 priority: critical battery > status > mode content > battery indicator
     if _status_clear_at and ticks_diff(now, _status_clear_at) >= 0:
         _status("")
-    if not _status_clear_at:
+    if _bat_v < _BAT_CRIT_V:
+        lcd.move_to(0, 1)
+        lcd.putstr(_fmt_battery())
+    elif not _status_clear_at:
         if _count_mode:
             lcd.move_to(0, 1)
             lcd.putstr(_fmt_weight(w))
         elif _peak_hold:
             lcd.move_to(0, 1)
             lcd.putstr(_fmt_peak(_peak_value))
+        else:
+            lcd.move_to(0, 1)
+            lcd.putstr(_fmt_battery())
 
     # Tare button: active-low, short press (>=50ms) = tare, long press (>=1s) = cycle unit
     btn = _TARE_BTN.value()
@@ -254,6 +315,9 @@ def run():
     load_cal()
     hx.set_adaptive_threshold(int(50 * hx.SCALE))
     hx.set_time_constant(0.1)
+
+    _bat_v = get_battery_v()
+    _update_bat_char()
 
     lcd.clear()
     lcd.move_to(0, 0)

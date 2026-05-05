@@ -64,6 +64,13 @@ class LCD:
         for c in s:
             self._send(ord(c), _RS)
 
+    def define_char(self, slot, bitmap):
+        """Write a custom character to CGRAM slot 0-7. bitmap is 8 bytes (5 bits each)."""
+        self._cmd(0x40 | ((slot & 0x07) << 3))
+        for row in bitmap:
+            self._send(row, _RS)
+        self._cmd(0x80)   # return to DDRAM so subsequent writes go to the display
+
     def backlight(self, on):
         self._bl = _BL if on else 0
         self._write(0)
